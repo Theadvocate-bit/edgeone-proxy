@@ -41,10 +41,17 @@
           </div>
           <form id="urlForm" onsubmit="redirectToProxy(event)">
             <div class="relative">
-              <input type="text" id="targetUrl" required
-                class="w-full px-4 py-3 text-lg text-white bg-white/10 rounded-lg border border-transparent focus:border-white/50 focus:ring-0 focus:outline-none transition duration-300"
+              <input type="text" id="targetUrl" required autocomplete="url"
+                class="w-full px-4 py-3 text-lg text-white bg-white/10 rounded-lg border border-transparent focus:border-white/50 focus:ring-0 focus:outline-none transition duration-300 placeholder:text-white/40"
                 placeholder="请输入目标网址...">
             </div>
+            <!-- 访问密钥：与 proxy.js 的 ACCESS_KEY 配套，未设置密钥可留空 -->
+            <div class="relative mt-3">
+              <input type="password" id="accessKey" autocomplete="off"
+                class="w-full px-4 py-2 text-sm text-white bg-white/10 rounded-lg border border-transparent focus:border-white/50 focus:ring-0 focus:outline-none transition duration-300 placeholder:text-white/40"
+                placeholder="访问密钥（可选，与 proxy.js 的 ACCESS_KEY 一致）">
+            </div>
+            <div id="errMsg" class="hidden mt-2 text-sm text-red-300"></div>
             <button type="submit"
               class="w-full mt-4 px-4 py-3 text-lg font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50 transition duration-300">
               开始代理
@@ -58,14 +65,51 @@
     </div>
   </div>
   <script>
+    const KEY_STORAGE = 'proxy_access_key';
+
+    // 读取记住的密钥
+    try {
+      const savedKey = localStorage.getItem(KEY_STORAGE);
+      if (savedKey) document.getElementById('accessKey').value = savedKey;
+    } catch (e) { /* localStorage 不可用时忽略 */ }
+
+    function showError(msg) {
+      const el = document.getElementById('errMsg');
+      el.textContent = msg;
+      el.classList.remove('hidden');
+    }
+
     function redirectToProxy(event) {
       event.preventDefault();
-      const targetUrl = document.getElementById('targetUrl').value.trim();
-      if (targetUrl) {
-        const proxyUrl = window.location.origin + '/proxy?url=' + encodeURIComponent(targetUrl);
-        window.open(proxyUrl, '_blank');
+
+      let targetUrl = document.getElementById('targetUrl').value.trim();
+      const key = document.getElementById('accessKey').value.trim();
+
+      // 自动补全协议
+      if (targetUrl && !/^https?:\/\//i.test(targetUrl)) {
+        targetUrl = 'https://' + targetUrl;
       }
+
+      // 合法性校验（和 proxy.js 保持一致：只允许 http/https）
+      let parsed;
+      try { parsed = new URL(targetUrl); } catch (e) { parsed = null; }
+      if (!parsed || !/^https?:$/.test(parsed.protocol)) {
+        showError('请输入合法的 http/https 网址');
+        return;
+      }
+      document.getElementById('errMsg').classList.add('hidden');
+
+      // 记住密钥
+      try { localStorage.setItem(KEY_STORAGE, key); } catch (e) {}
+
+      // 组装代理地址：有密钥时 key 在前，url 必须在最后（proxy.js 约定）
+      let proxyUrl = window.location.origin + '/proxy?';
+      if (key) proxyUrl += 'key=' + encodeURIComponent(key) + '&';
+      proxyUrl += 'url=' + encodeURIComponent(parsed.href);
+
+      window.open(proxyUrl, '_blank');
     }
+
     if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
       document.documentElement.classList.add('dark');
     }
