@@ -6,16 +6,15 @@
 
 ## ✨ 特性
 
-- **单文件自包含** — `functions/proxy.js` 一个文件搞定代理逻辑、提示页 HTML/CSS/JS、去水印策略；零外部依赖，不 `import`、不读盘、不拉 CDN。
+- **单文件自包含** — `functions/proxy.js` 一个文件搞定代理逻辑、提示页 HTML/CSS/JS；零外部依赖，不 `import`、不读盘、不拉 CDN。
 - **无密钥** — 无需访问密码或 API Key，Fork 即可部署使用。
 - **落地页 + 代理双职责** — `static/index.html` 是 Tailwind 现代化落地页（挂载到 `/`），`functions/proxy.js` 是代理函数（挂载到 `/proxy`）；输入目标网址后一键跳转，或直接复制代理后的完整链接分享。
 - **完整 URL 改写** — 处理 `href`/`src`/`srcset`/`action`/`<base>`/`meta refresh`/CSS `url()`/`@import` 以及裸的源站字符串，避免代理页面出现混合内容或跳回源站。
-- **去水印（4 层）** — CSS 强制隐藏 → 掐断 `body.appendChild/insertBefore` 通道 → `MutationObserver` 清理 → 源头剥离脚本；针对 EdgeOne 免费版末尾注入的「Powered by EdgeOne Pages」推广横幅。
 - **Cookie 按站点隔离** — 默认开启；代理多个站点时给 Cookie 名加站点前缀，防止不同被代理站点共用 Cookie 命名空间导致 session 串味。
 - **可配置** — 白名单、固定 UA、入口路径、CPU 预算、响应体改写上限均可通过 Makers 控制台的 `context.env` 配置，无需改代码。
 - **响应头清洗** — 剥离 `CSP`/`X-Frame-Options`/`COOP`/`COEP`/`CORP`/`STRICT-TRANSPORT-SECURITY` 等干扰代理的响应头；`Set-Cookie` 的 `Domain` 剥离、`Path` 归一。
 - **重定向跟进** — 30x 状态下的 `Location` 头会自动重写为代理后的地址，浏览器不会跳回源站。
-- **边缘加速** — 全球节点就近回源，低延迟；CPU 预算与响应体预算内执行改写，任一超限即降级为流式透传（去水印无条件保留）。
+- **边缘加速** — 全球节点就近回源，低延迟；CPU 预算与响应体预算内执行改写，任一超限即降级为流式透传。
 
 ## 🚀 部署（EdgeOne Makers）
 
@@ -79,12 +78,10 @@ EdgeOne Pages 的路由规则是「静态资源优先于 Edge Functions」。落
    - HTML：`href`/`src`/`srcset`/`action`/`<base>`/`meta refresh`/CSS `url()`/裸源站字符串
    - CSS/JS/JSON：`url()`/`@import`/裸源站字符串
    - 剥离 `integrity` 属性（原站哈希对改写后的内容不匹配）
-   - 剥离上游已内联的水印脚本和节点
-6. **去水印** — 注入对策脚本（掐断 `appendChild`、`MutationObserver` 清理、CSS 隐藏），无条件执行。
-7. **响应头清洗** — 移除代理场景下有害的头，`Set-Cookie` 剥离 `Domain`、`Path` 归一、多个 Cookie 拆分，并按需加站点前缀。
-8. **重定向处理** — 3xx 状态下重写 `Location` 为代理地址。
+6. **响应头清洗** — 移除代理场景下有害的头，`Set-Cookie` 剥离 `Domain`、`Path` 归一、多个 Cookie 拆分，并按需加站点前缀。
+7. **重定向处理** — 3xx 状态下重写 `Location` 为代理地址。
 
-两级预算控制：`PROXY_BUDGET_MS` 限 CPU 时间、`PROXY_MAX_BYTES` 限响应体大小。任一项超限即降级为流式透传，但去水印步骤永远保留。
+两级预算控制：`PROXY_BUDGET_MS` 限 CPU 时间、`PROXY_MAX_BYTES` 限响应体大小。任一项超限即降级为流式透传。
 
 ## 📁 项目结构
 
@@ -106,7 +103,6 @@ edgeone-proxy/
 - 使用者需了解，本项目可能被用于访问受限内容或进行未经授权的活动。作者强烈反对任何不当使用行为，并鼓励使用者在合法合规的前提下使用。
 - 请确保你拥有对所代理目标地址的合法访问权限。
 - 任何使用者在使用本项目时，需自行承担全部风险。作者和腾讯云不对任何滥用、不当使用或由此导致的任何损害承担责任。
-- 去水印功能仅针对 EdgeOne 平台自身的免费版推广横幅，不应用于规避任何第三方网站的合理使用限制。
 
 ## 📄 许可证
 
