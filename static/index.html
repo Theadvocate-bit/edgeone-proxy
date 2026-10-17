@@ -28,6 +28,29 @@
       background-color: rgba(30, 41, 59, 0.5);
       border: 1px solid rgba(255, 255, 255, 0.1);
     }
+    /* 提示条用原生 CSS 控制显隐：CSS 变量/工具类由 CDN 动态生成，靠它切换不够稳 */
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 40px;
+      z-index: 50;
+      padding: 10px 20px;
+      border-radius: 999px;
+      background: rgba(30, 41, 59, 0.94);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      color: #fff;
+      font-size: 14px;
+      line-height: 1.2;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, 16px);
+      transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+    .toast.on {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
   </style>
 </head>
 <body>
@@ -39,60 +62,139 @@
             <h1 class="text-3xl font-bold text-white">代理万物</h1>
             <p class="text-gray-200 mt-2">一个现代、快速、可靠的代理服务。</p>
           </div>
-          <form id="urlForm" onsubmit="redirectToProxy(event)">
+          <form id="urlForm" novalidate>
             <div class="relative">
-              <input type="text" id="targetUrl" required autocomplete="url"
+              <input type="text" id="targetUrl" autocomplete="url" inputmode="url" spellcheck="false"
+                aria-label="目标网址"
                 class="w-full px-4 py-3 text-lg text-white bg-white/10 rounded-lg border border-transparent focus:border-white/50 focus:ring-0 focus:outline-none transition duration-300 placeholder:text-white/40"
-                placeholder="请输入目标网址...">
+                placeholder="请输入目标网址，例如 example.com">
             </div>
             <div id="errMsg" class="hidden mt-2 text-sm text-red-300"></div>
-            <button type="submit"
-              class="w-full mt-4 px-4 py-3 text-lg font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50 transition duration-300">
-              开始代理
-            </button>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">
+              <button type="submit"
+                class="w-full px-4 py-3 text-lg font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50 transition duration-300">
+                开始代理
+              </button>
+              <button type="button" id="copyBtn"
+                class="w-full px-4 py-3 text-lg font-semibold text-white bg-white/15 border border-white/30 rounded-lg hover:bg-white/25 focus:outline-none focus:ring-2 focus:ring-white/50 focus:ring-opacity-50 transition duration-300">
+                复制代理链接
+              </button>
+            </div>
+            <!-- 生成后的代理地址：只读展示，点一下可全选 -->
+            <div id="linkPreview" hidden
+              class="mt-3 px-3 py-2 text-xs leading-relaxed text-white/75 bg-black/25 border border-white/15 rounded-lg break-all select-all"></div>
           </form>
         </div>
       </div>
-      <footer class="text-center mt-6">
-        <p class="text-sm text-white/70">由 EdgeOne Pages 强力驱动。在 GitHub 上 Fork 我。</p>
-      </footer>
     </div>
   </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script>
-    function showError(msg) {
-      const el = document.getElementById('errMsg');
-      el.textContent = msg;
-      el.classList.remove('hidden');
-    }
+    (function () {
+      // 代理入口 = edge-functions 里的函数文件名（文件名即路由，无需另外配置）：
+      //   edge-functions/proxy.js  →  '/proxy'   ← 当前默认
+      //   edge-functions/index.js  →  '/'        如果函数直接挂在根路径，把这里改成 '/'
+      var PROXY_PATH = '/proxy';
 
-    function redirectToProxy(event) {
-      event.preventDefault();
+      var form = document.getElementById('urlForm');
+      var input = document.getElementById('targetUrl');
+      var errMsg = document.getElementById('errMsg');
+      var preview = document.getElementById('linkPreview');
+      var copyBtn = document.getElementById('copyBtn');
+      var toast = document.getElementById('toast');
+      var toastTimer = null;
 
-      let targetUrl = document.getElementById('targetUrl').value.trim();
-
-      // 自动补全协议
-      if (targetUrl && !/^https?:\/\//i.test(targetUrl)) {
-        targetUrl = 'https://' + targetUrl;
+      function showError(msg) {
+        errMsg.textContent = msg;
+        errMsg.classList.remove('hidden');
       }
 
-      // 合法性校验（和 functions/index.js 保持一致：只允许 http/https）
-      let parsed;
-      try { parsed = new URL(targetUrl); } catch (e) { parsed = null; }
-      if (!parsed || !/^https?:$/.test(parsed.protocol)) {
-        showError('请输入合法的 http/https 网址');
-        return;
+      function clearError() {
+        errMsg.classList.add('hidden');
       }
-      document.getElementById('errMsg').classList.add('hidden');
 
-      // 组装代理地址：入口路径取自当前页面地址，url 参数放在最后
-      let proxyUrl = window.location.origin + window.location.pathname + '?url=' + encodeURIComponent(parsed.href);
+      function say(msg) {
+        toast.textContent = msg;
+        toast.classList.add('on');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () { toast.classList.remove('on'); }, 1800);
+      }
 
-      window.open(proxyUrl, '_blank');
-    }
+      // 生成代理地址：只接受 http/https，url 参数必须放最后
+      function buildProxyUrl() {
+        var raw = (input.value || '').trim();
+        if (!raw || /^javascript:/i.test(raw)) return '';
+        // 认「协议://」而不是「单词:」，否则 example.com:8080 会被当成协议名判无效
+        if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) raw = 'https://' + raw;
+        var parsed;
+        try { parsed = new URL(raw); } catch (e) { return ''; }
+        if (!/^https?:$/.test(parsed.protocol)) return '';
+        return window.location.origin + PROXY_PATH + '?url=' + encodeURIComponent(parsed.href);
+      }
 
-    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-      document.documentElement.classList.add('dark');
-    }
+      function resolve() {
+        var url = buildProxyUrl();
+        if (!url) {
+          showError('请输入合法的 http/https 网址');
+          input.focus();
+          return '';
+        }
+        clearError();
+        preview.hidden = false;
+        preview.textContent = url;
+        return url;
+      }
+
+      // 非 https / 无剪贴板权限时的兜底复制
+      function fallbackCopy(text) {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:0;left:-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        var ok = false;
+        try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+        document.body.removeChild(ta);
+        return ok;
+      }
+
+      function copy(url) {
+        if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+          navigator.clipboard.writeText(url).then(
+            function () { say('已复制代理链接'); },
+            function () { say(fallbackCopy(url) ? '已复制代理链接' : '复制失败，请手动复制'); }
+          );
+          return;
+        }
+        say(fallbackCopy(url) ? '已复制代理链接' : '复制失败，请手动复制');
+      }
+
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+        var url = resolve();
+        if (!url) return;
+        window.open(url, '_blank', 'noopener');
+      });
+
+      copyBtn.addEventListener('click', function () {
+        var url = resolve();
+        if (url) copy(url);
+      });
+
+      input.addEventListener('input', function () {
+        clearError();
+        if (preview.hidden) return;
+        var url = buildProxyUrl();
+        preview.textContent = url || '';
+        preview.hidden = !url;
+      });
+
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.documentElement.classList.add('dark');
+      }
+    })();
   </script>
 </body>
 </html>
