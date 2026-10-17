@@ -27,13 +27,20 @@
 //   PROXY_UA         固定 User-Agent（反爬伪装）；留空 = 透传访客真实 UA
 //   PROXY_PATH       固定入口路径（如 /proxy）；留空 = 采用请求自身路径
 //   PROXY_BUDGET_MS  单次 HTML 改写的 CPU 预算毫秒（默认 120，平台硬限 200）
+//   PROXY_MAX_BYTES  参与改写的响应体上限字节数（默认 3145728 = 3MB；超出直接流式透传）
+//   PROXY_COOKIE_ISOLATE  Cookie 按站点隔离，默认开；设 0 关闭。
+//       浏览器只给「代理域名」一个来源存 Cookie，多个被代理站点会共用同一个 Cookie
+//       命名空间——A 站脚本能读到 B 站的 session，同名 Cookie 还会互相覆盖。开启后
+//       回源方向给 Cookie 名加站点前缀，回源请求方向再剥掉。
+//       副作用：被代理页面的 JS 用 document.cookie 读「服务端下发」的 Cookie 时会看到
+//       带前缀的名字；JS 自己写的 Cookie 不带前缀，原样透传不受影响。遇到依赖 JS 读
+//       Cookie 的站点（CSRF token 之类），设 0 回到旧行为。
 // =============================================================
 
 // ---------- 0. 常量与预编译正则（模块级只编译一次，省 CPU）----------
 
 // 平台横幅文案：以百分号编码存放，交付/服务产物里不出现平台推广文案原文。
 const WM_CN = decodeURIComponent('%E5%BC%BA%E5%8A%9B%E9%A9%B1%E5%8A%A8');
-const WM_CN_ME = decodeURIComponent('%E6%88%91');
 const WM_EN = 'Powered by EdgeOne Pages';
 
 // 剥离上游 HTML 里已内联的水印脚本 / 节点
@@ -53,13 +60,15 @@ const RE_CSS_IMPORT = /@import\s+(['"])([^'"]+)\1/gi;
 const RE_HEAD = /<head\b[^>]*>/i;
 const RE_HTML = /<html\b[^>]*>/i;
 const RE_BODY = /<body\b[^>]*>/i;
-const RE_SCHEME_SKIP = /^(?:javascript:|data:|blob:|mailto:|tel:|about:|#|)$/i;
+// 命中即跳过改写。# 开头的是页内锚点，必须原样保留，否则点一下就是整页重载。
+const RE_SCHEME_SKIP = /^(?:javascript:|data:|blob:|mailto:|tel:|sms:|about:|#)/i;
 const RE_URL_PARAM = /[?&]url=([\s\S]*)$/;
 const RE_ASSET_PATH = /\.[a-z0-9]{1,6}$/i;
 const RE_ESCAPE = /[.*+?^${}()|[\]\\]/g;
 
-const REWRITE_TYPES = ['text/html', 'text/css', 'javascript', 'application/json'];
-const REDIRECT_STATUS = [301, 302, 303, 307, 308];
+// 参与改写的 content-type 特征（ctype 进来前已转小写）
+const RE_REWRITE = /text\/html|text\/css|javascript|application\/json/;
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
 const DROP_REQUEST_HEADERS = ['host', 'accept-encoding', 'content-length', 'connection', 'keep-alive', 'transfer-encoding'];
 const DROP_RESPONSE_HEADERS = new Set([
@@ -69,22 +78,22 @@ const DROP_RESPONSE_HEADERS = new Set([
   'link', 'alt-svc', 'keep-alive', 'connection',
 ]);
 
-// ---------- 1. 默认配置（可被 context.env 覆盖）----------
+// ---------- 1. 配置（全部取自 context.env，缺省即内置默认）----------
 
-const DEFAULT_HOSTS = [];    // 例：['example.com', 'www.example.com']；空数组 = 不限制
-const DEFAULT_UA = '';       // 例：'Mozilla/5.0 ...'；留空 = 透传访客 UA
-const DEFAULT_PATH = '';     // 例：'/proxy'；留空 = 采用请求自身路径
-const DEFAULT_BUDGET_MS = 120;
+// 正数才生效，空串 / 非数字 / 负数一律回落默认值
+const positive = (v, fallback) => (Number(v) > 0 ? Number(v) : fallback);
 
 function readConfig(context) {
   const env = (context && context.env) || {};
-  const rawHosts = env.PROXY_HOSTS ? String(env.PROXY_HOSTS).split(/[\s,]+/).filter(Boolean) : DEFAULT_HOSTS;
-  const budget = Number(env.PROXY_BUDGET_MS);
   return {
-    hosts: rawHosts,
-    ua: env.PROXY_UA ? String(env.PROXY_UA) : DEFAULT_UA,
-    entryPath: env.PROXY_PATH ? String(env.PROXY_PATH) : DEFAULT_PATH,
-    budgetMs: budget > 0 ? budget : DEFAULT_BUDGET_MS,
+    // 目标域名白名单，逗号或空格分隔；空 = 不限制。例：'example.com,www.example.com'
+    hosts: env.PROXY_HOSTS ? String(env.PROXY_HOSTS).split(/[\s,]+/).filter(Boolean) : [],
+    ua: String(env.PROXY_UA || ''),           // 例：'Mozilla/5.0 ...'；空 = 透传访客 UA
+    entryPath: String(env.PROXY_PATH || ''),  // 例：'/proxy'；空 = 采用请求自身路径
+    budgetMs: positive(env.PROXY_BUDGET_MS, 120),
+    maxBytes: positive(env.PROXY_MAX_BYTES, 3 * 1024 * 1024),
+    // 默认开，只有显式写成 0/false/off/no 才关
+    cookieIsolate: !/^(?:0|false|off|no)$/.test(String(env.PROXY_COOKIE_ISOLATE || '').trim().toLowerCase()),
   };
 }
 
@@ -159,17 +168,22 @@ const WATERMARK_KILLER =
 
 // 剥离源页面/模板里已内联存在的水印代码（先做 indexOf 快速判定，绝大多数页直接跳过）
 function stripWatermark(text) {
-  if (text.indexOf('edgeone') === -1 && text.indexOf(WM_CN) === -1 && text.indexOf(WM_EN) === -1) return text;
+  // 快速判定要把大小写两种写法都覆盖：只查 'edgeone' 会漏掉 'EdgeOne'
+  // （WM_EN 里含 'EdgeOne'，所以查这一个词就够了，不必再 toLowerCase 整篇）
+  if (text.indexOf('edgeone') === -1 && text.indexOf('EdgeOne') === -1 && text.indexOf(WM_CN) === -1) return text;
   return text.replace(RE_SCRIPT_WM, '').replace(RE_DIV_WM, '');
 }
 
-// 把去水印样式/脚本注入任意 HTML（落地页与每个代理页面都会带上）
+// 落地页与每个代理页面都要带上的整块对策
+const ANTI_WATERMARK = WATERMARK_CSS + WATERMARK_KILLER;
+// 注入锚点按优先级排：<head> 最稳，退而求其次 <html>、<body>，都没有就整块前置
+const WM_ANCHORS = [RE_HEAD, RE_HTML, RE_BODY];
+
 function injectAntiWatermark(html) {
-  const block = WATERMARK_CSS + WATERMARK_KILLER;
-  if (RE_HEAD.test(html)) return html.replace(RE_HEAD, (m) => m + block);
-  if (RE_HTML.test(html)) return html.replace(RE_HTML, (m) => m + block);
-  if (RE_BODY.test(html)) return html.replace(RE_BODY, (m) => m + block);
-  return block + html;
+  for (const re of WM_ANCHORS) {
+    if (re.test(html)) return html.replace(re, (m) => m + ANTI_WATERMARK);
+  }
+  return ANTI_WATERMARK + html;
 }
 
 // ---------- 4. 链接改写 ----------
@@ -182,7 +196,11 @@ function originRegex(host) {
   let re = originReCache.get(host);
   if (!re) {
     if (originReCache.size > 50) originReCache.clear();
-    re = new RegExp('(?:https?:)?(?:\\\\?/){2}' + escapeRegExp(host) + '(?:\\\\?/[^\\s"\'<>`\\\\]*)?', 'gi');
+    re = new RegExp(
+      '(?:https?:)?(?:\\\\?/){2}' + escapeRegExp(host) +
+      // 路径段允许 `\/` 这种转义斜杠，否则 JSON / 内联 CSS 里的
+      // "https:\/\/host\/a.js" 只会替换到 host，残留 `\/a.js`
+      '(?:\\\\?/(?:[^\\s"\'<>`\\\\]|\\\\/)*)?', 'gi');
     originReCache.set(host, re);
   }
   return re;
@@ -198,10 +216,6 @@ function resolveUrl(href, baseHref) {
     const abs = new URL(href.trim(), baseHref);
     return /^https?:$/.test(abs.protocol) ? abs.href : null;
   } catch (e) { return null; }
-}
-
-function isProxied(href, entry) {
-  return href.indexOf(entry.path + '?url=') !== -1;
 }
 
 function replaceOriginStrings(text, target, entry) {
@@ -242,7 +256,8 @@ function rewriteHtml(html, target, entry, inBudget) {
 
   const wrap = (href) => {
     const v = href && href.trim();
-    if (!v || RE_SCHEME_SKIP.test(v) || isProxied(v, entry)) return href;
+    // 空值、非 http 协议（含页内 #锚点）、已经是代理链接 → 原样保留
+    if (!v || RE_SCHEME_SKIP.test(v) || v.indexOf(entry.path + '?url=') !== -1) return href;
     const abs = resolveUrl(v, resolveBase);
     return abs ? proxiedUrl(abs, entry) : href;
   };
@@ -251,7 +266,11 @@ function rewriteHtml(html, target, entry, inBudget) {
     html = html.replace(RE_ATTR, (m, pre, attr, v1, v2) => {
       const val = v1 !== undefined ? v1 : v2;
       if (attr.toLowerCase() === 'srcset') {
-        const rw = val.split(',').map((p) => {
+        // data: URI 自带逗号（base64、内联 SVG），按裸逗号切分会把它拦腰截断，
+        // 后半段还会被当成相对地址再代理一次。含 data: 时只认「逗号 + 空白」，
+        // 这两种情况里 data URI 内部的逗号后面都不会跟空白，因此不会误切。
+        const sep = val.indexOf('data:') !== -1 ? /,(?=\s)/ : /,/;
+        const rw = val.split(sep).map((p) => {
           const parts = p.trim().split(/\s+/);
           if (parts[0]) parts[0] = wrap(parts[0]);
           return parts.join(' ');
@@ -294,17 +313,32 @@ function rewriteText(text, target, entry) {
 // ---------- 6. 响应头 ----------
 // 该运行时用普通对象 / [键,值] 数组作为 HeadersInit，不构造 Headers 实例。
 
-function cleanResponseHeaders(src) {
+// 优先用 getSetCookie()：有的运行时把多条 Cookie 合并成一行，直接读 get() 会丢。
+function rawSetCookies(src) {
+  if (typeof src.getSetCookie === 'function') {
+    try { return src.getSetCookie(); } catch (e) {}
+  }
+  const v = src.get('set-cookie');
+  return v ? [v] : [];
+}
+
+function cleanResponseHeaders(src, ck, secure) {
   const out = [];
   const seenCookies = new Set();
+  let cookiesDone = false;
   for (const [k, v] of src.entries()) {
     const lk = k.toLowerCase();
     if (DROP_RESPONSE_HEADERS.has(lk)) continue;
     if (lk === 'set-cookie') {
-      for (const c of cleanSetCookie(v)) {
-        if (seenCookies.has(c)) continue;
-        seenCookies.add(c);
-        out.push(['set-cookie', c]);
+      // 合并成一行的多条 Cookie 只在第一轮展开一次
+      if (cookiesDone) continue;
+      cookiesDone = true;
+      for (const raw of rawSetCookies(src)) {
+        for (const c of cleanSetCookie(raw, ck, secure)) {
+          if (seenCookies.has(c)) continue;
+          seenCookies.add(c);
+          out.push(['set-cookie', c]);
+        }
       }
       continue;
     }
@@ -313,23 +347,64 @@ function cleanResponseHeaders(src) {
   return out;
 }
 
+// ---------- 6.1 Cookie 按站点隔离 ----------
+// 浏览器只认「代理域名」这一个来源，所有被代理站点共用一个 Cookie 空间：
+// A 站页面里的脚本能读到 B 站的 session，同名 Cookie 还会互相覆盖。
+// 做法：回源方向上给 Cookie 名加站点前缀，回源请求方向再剥掉。
+function cookieKey(host) {
+  return 'p_' + String(host || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') + '_';
+}
+
+function prefixCookie(cookie, ck) {
+  const i = cookie.indexOf('=');
+  if (i <= 0) return cookie;
+  const name = cookie.slice(0, i).trim();
+  if (!name || name.indexOf(ck) === 0) return cookie;   // 已有前缀就不重复加
+  return ck + name + cookie.slice(i);
+}
+
 // 有的运行时把多个 Cookie 用逗号拼成一行，直接改写会把后一个 Cookie 吞掉。
 // 只在「逗号后紧跟 name=」处切分，因此不会误伤 Expires=Wed, 21 Oct ... 里的逗号。
-function cleanSetCookie(value) {
+function cleanSetCookie(value, ck, secure) {
   return String(value)
     .split(/,\s*(?=[^,;=\s]+=)/)
-    .map((c) => c.trim()
-      .replace(/;\s*domain=[^;]*/gi, '')
-      .replace(/;\s*path=[^;]*/gi, '; Path=/'))
+    .map((c) => {
+      let s = c.trim()
+        .replace(/;\s*domain=[^;]*/gi, '')
+        .replace(/;\s*path=[^;]*/gi, '; Path=/')
+        .replace(/;\s*partitioned/gi, '');
+      if (!secure) {
+        // 代理域名不是 https 时，带 Secure / SameSite=None 的 Cookie 会被浏览器
+        // 直接丢掉（而且不报错），落地前先摘掉，否则登录态永远存不住
+        s = s.replace(/;\s*secure/gi, '').replace(/;\s*samesite\s*=\s*none/gi, '; SameSite=Lax');
+      }
+      if (ck) s = prefixCookie(s, ck);
+      return s;
+    })
     .filter(Boolean);
 }
 
-function buildUpstreamHeaders(request, target, cfg, ip) {
+function buildUpstreamHeaders(request, target, cfg, ip, ck, hop) {
   const headers = plainHeaders(request.headers);
   for (const k of DROP_REQUEST_HEADERS) delete headers[k];
   headers.referer = target.href;
   if (cfg.ua) headers['user-agent'] = cfg.ua;
   if (ip) { headers['x-real-ip'] = ip; headers['x-forwarded-for'] = ip; }
+  // 回环保险：正常请求不会带这个头，只有自己代理自己时才会累加上去
+  headers['x-eo-proxy-hop'] = String(hop);
+  // Cookie 反向映射：带本前缀的还原成原名；无前缀的（页面 JS 自己写的）原样透传
+  const rawCookie = headers.cookie;
+  if (rawCookie) {
+    const kept = [];
+    for (const c of String(rawCookie).split(/;\s*/)) {
+      if (!c) continue;
+      const eq = c.indexOf('=');
+      if (eq <= 0) continue;
+      const name = c.slice(0, eq).trim();
+      kept.push(ck && name.indexOf(ck) === 0 ? name.slice(ck.length) + c.slice(eq) : c);
+    }
+    if (kept.length) headers.cookie = kept.join('; '); else delete headers.cookie;
+  }
   return headers;
 }
 
@@ -362,11 +437,16 @@ const PAGE_CSS =
   'font-size:14px;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:999999}' +
   '.toast.on{opacity:1;transform:translateX(-50%) translateY(0)}';
 
+// 页面里凡是来自外部（入口路径、错误信息、目标地址）的文字，拼进 HTML 前都要转义。
+// 现在靠 URL 解析器的百分号编码是安全的，但那是巧合，不是保证。
+const RE_ESC_HTML = /[&<>"']/g;
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const escapeHtml = (s) => String(s).replace(RE_ESC_HTML, (c) => ESC_MAP[c]);
+
 function htmlPage(title, body, script) {
-  const wm = WATERMARK_CSS + WATERMARK_KILLER;
   return '<!doctype html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n' +
     '<meta name="viewport" content="width=device-width, initial-scale=1">\n' +
-    '<title>' + title + '</title>\n<style>' + PAGE_CSS + '</style>\n' + wm + '\n</head>\n<body>\n' +
+    '<title>' + escapeHtml(title) + '</title>\n<style>' + PAGE_CSS + '</style>\n' + ANTI_WATERMARK + '\n</head>\n<body>\n' +
     body + (script ? '\n<script>\n' + script + '\n</script>\n' : '') + '</body>\n</html>';
 }
 
@@ -374,7 +454,8 @@ const LANDING_SCRIPT =
   '(function(){' +
   'var input=document.getElementById("u"),toast=document.getElementById("t"),linkBox=document.getElementById("l");' +
   'function norm(v){v=(v||"").trim();if(!v||/^javascript:/i.test(v))return "";' +
-  'if(!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(v))v="https://"+v;return v}' +
+  // 认「协议://」而不是「单词:」——否则 example.com:8080 会被当成协议名直接判无效
+  'if(!/^[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\//.test(v))v="https://"+v;return v}' +
   // 入口路径取自当前地址，因此换 edge-functions 里的文件名/位置都不用改这一份代码
   'function proxyUrl(v){var abs=norm(v);if(!abs)return "";' +
   'try{var u=new URL(abs);if(!/^https?:$/.test(u.protocol))return "";' +
@@ -407,7 +488,7 @@ function landingPage() {
     '<input id="u" type="text" placeholder="https://example.com" spellcheck="false">\n' +
     '<div class="btns">\n' +
     '<button type="submit" class="primary">开始代理</button>\n' +
-    '<button type="button" class="ghost" id="c">复制连接</button>\n' +
+    '<button type="button" class="ghost" id="c">复制链接</button>\n' +
     '</div>\n</form>\n' +
     '<div class="link" id="l" hidden></div>\n' +
     '<div class="toast" id="t"></div>\n' +
@@ -415,54 +496,91 @@ function landingPage() {
   return htmlPage('网页代理', body, LANDING_SCRIPT);
 }
 
-function noticePage(title, text, entry) {
+// 错误页：标题固定，正文是要给人看的原因
+function noticePage(text, entry) {
   const body =
     '<main class="card">\n' +
-    '<h1>' + title + '</h1>\n' +
-    '<p class="sub">' + text + '</p>\n' +
-    '<div class="link">用法：' + entry.path + '?url=&lt;目标网址&gt;（url 参数请放在最后）</div>\n' +
+    '<h1>无法代理</h1>\n' +
+    '<p class="sub">' + escapeHtml(text) + '</p>\n' +
+    '<div class="link">用法：' + escapeHtml(entry.path) + '?url=&lt;目标网址&gt;（url 参数请放在最后）</div>\n' +
     '</main>';
-  return htmlPage(title, body, '');
+  return htmlPage('无法代理', body, '');
 }
 
 // ---------- 8. 主流程 ----------
 
-function textResponse(text, status) {
-  return new Response(text + '\n', {
-    status,
-    headers: { 'content-type': 'text/plain; charset=utf-8' },
-  });
+const textResponse = (text, status) =>
+  new Response(text + '\n', { status, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+
+const htmlResponse = (html, status) =>
+  new Response(html, { status, headers: { 'content-type': 'text/html; charset=utf-8' } });
+
+// 回源响应未必是 UTF-8：国内站点大量是 GBK/GB2312。而 Response.text() 在规范里
+// 固定按 UTF-8 解码（不看 charset），硬用会把正文解成不可逆的乱码，再配上原封不动
+// 的 charset 头回给浏览器就是二次乱码。所以这里自己按声明的 charset 解码，
+// 回给浏览器时统一改写成 utf-8，两侧对齐。
+function charsetOf(ctype) {
+  const m = /charset\s*=\s*"?([\w-]+)/i.exec(ctype || '');
+  const cs = m ? m[1].toLowerCase() : 'utf-8';
+  // gb2312 / gbk 都是 gb18030 的子集，用超集解码避免生僻字丢字
+  return /^(?:gb2312|gbk|x-gbk|gb_2312-80)$/.test(cs) ? 'gb18030' : cs;
 }
 
-function htmlResponse(html, status) {
-  return new Response(html, {
-    status,
-    headers: { 'content-type': 'text/html; charset=utf-8' },
-  });
+async function readText(resp, ctype) {
+  const buf = await resp.arrayBuffer();
+  try {
+    return new TextDecoder(charsetOf(ctype)).decode(buf);
+  } catch (e) {
+    // 不认识的 charset 标签：退到 utf-8，至少不会整篇抛错
+    return new TextDecoder('utf-8').decode(buf);
+  }
+}
+
+// 改写后正文必然是 UTF-8 字符串，content-type 里的旧 charset 必须同步改掉
+function forceUtf8(outHeaders) {
+  for (let i = 0; i < outHeaders.length; i++) {
+    if (String(outHeaders[i][0]).toLowerCase() !== 'content-type') continue;
+    const v = String(outHeaders[i][1]).replace(/;\s*charset\s*=\s*"?[\w-]+"?/i, '').replace(/\s+$/, '');
+    outHeaders[i] = [outHeaders[i][0], v + '; charset=utf-8'];
+  }
+  return outHeaders;
 }
 
 // 客户端显式要非 HTML（图片/样式/脚本）时说人话即可；浏览器导航与空 Accept 都给页面。
 function wantsHtml(request) {
-  const accept = request.headers.get('accept') || '';
-  return accept === '' || accept.indexOf('text/html') !== -1 || accept.indexOf('*/*') !== -1;
+  const accept = (request.headers.get('accept') || '').trim();
+  if (accept === '') return true;
+  if (accept.indexOf('text/html') !== -1) return true;
+  // 只有「纯 */*」（curl、fetch 默认）才当页面请求；image/webp,*/* 这类带具体类型的
+  // 子资源请求不能返回 HTML 错误页，否则前端拿到一堆标签
+  return /^\*\/\*$/.test(accept);
+}
+
+// 丢掉上游正文：提前返回时若不 cancel，连接会一直挂着
+function cancelBody(resp) {
+  try { const p = resp.body && resp.body.cancel(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
 }
 
 function respond(request, resp) {
   if (request.method !== 'HEAD') return resp;
-  if (resp.body && typeof resp.body.cancel === 'function') { try { resp.body.cancel(); } catch (e) {} }
-  return new Response(null, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
+  cancelBody(resp);
+  // 不直接复用 resp.headers（Headers 实例）：本运行时只保证吃普通对象 / [键,值] 数组
+  return new Response(null, { status: resp.status, statusText: resp.statusText, headers: Array.from(resp.headers) });
 }
 
 function fail(request, status, message, entry) {
-  if (wantsHtml(request)) return respond(request, htmlResponse(noticePage('无法代理', message, entry), status));
-  return respond(request, textResponse(message, status));
+  const resp = wantsHtml(request) ? htmlResponse(noticePage(message, entry), status) : textResponse(message, status);
+  return respond(request, resp);
 }
 
 function extractTarget(rawUrl) {
   const m = RE_URL_PARAM.exec(rawUrl);
   if (!m) return null;
   let s = m[1];
-  if (/^https?%3A/i.test(s)) { try { s = decodeURIComponent(s); } catch (e) {} }
+  // 只在「形如 scheme%3A」时才整体解码（编码过的代理链接都是这种形态）。
+  // 这里放宽到任意 scheme 而不只是 https?，否则 ftp%3A… 会被当成非法地址报 400，
+  // 拿不到「只支持 http/https」这种能看懂的原因。
+  if (/^[a-z][a-z0-9+.-]*%3a/i.test(s)) { try { s = decodeURIComponent(s); } catch (e) {} }
   return s;
 }
 
@@ -481,15 +599,15 @@ async function handle(context) {
   // 入口路径：优先环境变量，其次「请求自身路径」——这样把文件放到 edge-functions 的
   // 任何位置（index.js / proxy.js / [[default]].js）都能自洽，无需改代码。
   const entry = { origin: incoming.origin, path: cfg.entryPath || incoming.pathname || '/' };
+  // 代理域名不是 https 时，回源下发的 Secure / SameSite=None Cookie 会被浏览器静默丢弃
+  const secureEntry = incoming.protocol === 'https:';
 
   const targetStr = extractTarget(request.url);
   if (!targetStr) {
     if (incoming.pathname === '/favicon.ico') return new Response(null, { status: 204 });
-    const pageLike = incoming.pathname === '/' || incoming.pathname.slice(-1) === '/' ||
-      !RE_ASSET_PATH.test(incoming.pathname);
-    if (pageLike && wantsHtml(request)) {
-      return respond(request, htmlResponse(landingPage(), 200));
-    }
+    // 目录 / 无扩展名的路径才给落地页；带扩展名的按资源请求回纯文本用法提示
+    const pageLike = incoming.pathname.endsWith('/') || !RE_ASSET_PATH.test(incoming.pathname);
+    if (pageLike && wantsHtml(request)) return respond(request, htmlResponse(landingPage(), 200));
     return respond(request, textResponse('用法: ' + entry.path + '?url=<目标URL>（url 参数放最后）', 400));
   }
 
@@ -499,14 +617,19 @@ async function handle(context) {
   }
   if (!/^https?:$/.test(target.protocol)) return fail(request, 403, '只支持 http/https 目标地址', entry);
   if (target.host === incoming.host) return fail(request, 403, '禁止代理自身', entry);
-  if (cfg.hosts.length && cfg.hosts.indexOf(target.host) === -1) {
+  // 回环保险：同一份函数挂在不同域名/别名上时，host 比对会失效，一路自我代理下去
+  // 会把调用次数打满。跳数头只有自己会写，客户端伪造也只会封掉自己。
+  const hop = Number(request.headers.get('x-eo-proxy-hop') || 0) || 0;
+  if (hop > 3) return fail(request, 508, '检测到代理回环，已中止', entry);
+  if (cfg.hosts.length && !cfg.hosts.includes(target.host)) {
     return fail(request, 403, '目标域名不在白名单内（PROXY_HOSTS）', entry);
   }
 
   const ip = clientIp(context);
+  const ck = cfg.cookieIsolate ? cookieKey(target.host) : '';
   const init = {
     method: request.method,
-    headers: buildUpstreamHeaders(request, target, cfg, ip),
+    headers: buildUpstreamHeaders(request, target, cfg, ip, ck, hop + 1),
     redirect: 'manual',
   };
   if (request.method !== 'GET' && request.method !== 'HEAD' && request.body) {
@@ -521,31 +644,41 @@ async function handle(context) {
     return fail(request, 502, '回源失败：' + e.message, entry);
   }
 
-  if (REDIRECT_STATUS.indexOf(resp.status) !== -1) {
+  // 正文与响应头由调用方给，状态码 / statusText 一律沿用上游
+  const build = (body, headers) =>
+    new Response(body, { status: resp.status, statusText: resp.statusText, headers });
+
+  if (REDIRECT_STATUS.has(resp.status)) {
     const loc = resp.headers.get('location');
-    if (loc) {
-      let abs = null;
-      try { abs = new URL(loc, target).href; } catch (e) {}
-      if (abs) {
-        if (resp.body && typeof resp.body.cancel === 'function') { try { resp.body.cancel(); } catch (e) {} }
-        return respond(request, new Response(null, { status: resp.status, headers: { location: proxiedUrl(abs, entry) } }));
-      }
+    const abs = loc ? resolveUrl(loc, target.href) : null;
+    if (abs) {
+      cancelBody(resp);
+      // 跳转响应也会下发 Cookie（登录 / SSO 链路靠的就是这个），不能只留 location
+      const rh = cleanResponseHeaders(resp.headers, ck, secureEntry)
+        .filter(([k]) => k.toLowerCase() !== 'location');
+      rh.push(['location', proxiedUrl(abs, entry)]);
+      return respond(request, build(null, rh));
     }
   }
 
   const ctype = (resp.headers.get('content-type') || '').toLowerCase();
-  const outHeaders = cleanResponseHeaders(resp.headers);
-  const rewritable = REWRITE_TYPES.some((t) => ctype.indexOf(t) !== -1);
+  const outHeaders = cleanResponseHeaders(resp.headers, ck, secureEntry);
+  const size = Number(resp.headers.get('content-length') || 0) || 0;
 
-  if (!rewritable || !resp.body) {
-    return respond(request, new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: outHeaders }));
+  // HEAD 不要正文；类型不参与改写、没有正文、或体量超预算 → 原样流式透传
+  // （超预算时不解码不跑正则，否则 CPU 会被平台 200ms 硬限掐断）
+  if (request.method === 'HEAD') return respond(request, build(null, outHeaders));
+  if (!resp.body || !RE_REWRITE.test(ctype) || size > cfg.maxBytes) {
+    return respond(request, build(resp.body, outHeaders));
   }
 
-  const isHtml = ctype.indexOf('text/html') !== -1;
-  const raw = await resp.text();
+  const raw = await readText(resp, ctype);
   const inBudget = makeBudget(cfg.budgetMs);
-  const body = isHtml ? rewriteHtml(raw, target, entry, inBudget) : rewriteText(raw, target, entry);
-  return respond(request, new Response(body, { status: resp.status, statusText: resp.statusText, headers: outHeaders }));
+  const body = ctype.indexOf('text/html') !== -1
+    ? rewriteHtml(raw, target, entry, inBudget)
+    : rewriteText(raw, target, entry);
+  forceUtf8(outHeaders);
+  return respond(request, build(body, outHeaders));
 }
 
 // ---------- 9. 导出 ----------
