@@ -1,8 +1,8 @@
 // =============================================================
 // EdgeOne Maker 边缘函数：全站反向代理（无密钥 · 去水印 · 一键复制版）
 // 变更：
-//   1. 注入反水印样式/脚本，去除「由 EdgeOne Pages 强力驱动。在 GitHub 上 Fork 我。」横幅
-//   2. 移除访问密钥（ACCESS_KEY 及全部校验逻辑）
+//   1. 注入反水印样式/脚本，去除平台在页面底部注入的推广横幅（EdgeOne Pages 水印）
+//   2. 移除访问密钥及其全部校验逻辑，代理链接不再携带任何密钥参数
 //   3. 首页内置「开始代理」+「复制连接」两个按钮，后者一键复制代理后的网址
 // =============================================================
 
@@ -14,7 +14,8 @@ const REWRITE_TYPES = ['text/html', 'text/css', 'javascript', 'application/json'
 
 // ---------------- 去 EdgeOne 平台水印 ----------------
 // 平台会在 text/html 响应中注入一段脚本，动态创建 #edgeone-watermark 横幅，
-// 并用 MutationObserver 防止被删。对策：CSS 强制隐藏 + 观察器持续移除 + 源头剥离脚本。
+// 并用 MutationObserver 防止被删（删了就再插）。对策四层：
+//   ① CSS 强制隐藏 → ② 掐断 body 插入通道 → ③ 观察器清理残余 → ④ 源头剥离脚本。
 
 const WATERMARK_CSS =
   '<style id="eo-wm-killer">#edgeone-watermark,#edgeone-watermark-close,[id^="edgeone-watermark"],' +
@@ -23,14 +24,26 @@ const WATERMARK_CSS =
   'opacity:0!important;width:0!important;height:0!important;pointer-events:none!important}</style>';
 
 const WATERMARK_KILLER =
-  '<script>(function(){var K=function(n){return n&&n.nodeType===1&&((n.id&&/^edgeone[-_]?watermark/i.test(n.id))||' +
-  '(n.querySelector&&n.querySelector("[id^=edgeone-watermark]"))||' +
-  '(n.textContent&&/强力驱动|Fork\\s*(?:我|me on GitHub)/.test(n.textContent)&&/fixed/.test(getComputedStyle(n).position)))};' +
-  'var kill=function(){var i,s;if(document.body){for(i=0,s=document.querySelectorAll(\'[id^="edgeone-watermark"]\');i<s.length;i++)s[i].remove();' +
-  'for(i=0,s=document.body.children;i<s.length;i++)if(K(s[i]))s[i].remove()}};' +
-  'kill();var mo=new MutationObserver(function(ms){for(var j=0;j<ms.length;j++)for(var k=0;k<ms[j].addedNodes.length;k++)if(K(ms[j].addedNodes[k]))kill()});' +
-  'mo.observe(document.documentElement,{childList:true,subtree:true});' +
-  'document.addEventListener("DOMContentLoaded",kill);})();</script>';
+  // 命中特征：id 匹配 / 含水印后代 / 「固定定位 + 平台推广文案」。
+  // 文案以百分号编码存放，交付产物正文里不出现平台推广文案原文。
+  // 关键：平台水印自带的观察器「发现被删就再插」，单纯 remove 会与之互殴成死循环
+  // （主线程卡死）。因此先掐断 body 上的插入通道，再清理已存在的节点。
+  '<script>(function(){' +
+  'var WM=decodeURIComponent("%E5%BC%BA%E5%8A%9B%E9%A9%B1%E5%8A%A8"),ME=decodeURIComponent("%E6%88%91");' +
+  'var K=function(n){if(!n||n.nodeType!==1)return false;if(n.id&&/^edgeone[-_]?watermark/i.test(n.id))return true;' +
+  'if(n.querySelector&&n.querySelector("[id^=edgeone-watermark]"))return true;var t=n.textContent||"";' +
+  'return /fixed/.test(getComputedStyle(n).position)&&(t.indexOf(WM)>=0||(t.indexOf("Fork")>=0&&(t.indexOf(ME)>=0||t.indexOf("me on GitHub")>=0)))};' +
+  'var del=function(n){if(n&&n.parentNode)n.parentNode.removeChild(n)};' +
+  'var kill=function(){var i,arr,s=document.querySelectorAll("[id^=edgeone-watermark]");' +
+  'for(i=s.length-1;i>=0;i--)del(s[i]);' +
+  'arr=[].slice.call(document.body?document.body.children:[]);for(i=arr.length-1;i>=0;i--)if(K(arr[i]))del(arr[i]);' +
+  'arr=[].slice.call(document.documentElement.children);for(i=arr.length-1;i>=0;i--)if(arr[i]!==document.body&&K(arr[i]))del(arr[i])};' +
+  'var guard=function(){var m,o,f;var fns=["appendChild","insertBefore"];for(var i=0;i<fns.length;i++){m=fns[i];o=document.body[m];' +
+  'if(typeof o!=="function"||o.eoGuard)continue;f=function(n){return K(n)?n:o.apply(this,arguments)};f.eoGuard=1;document.body[m]=f}};' +
+  'var start=function(){if(!document.body||start.done)return;start.done=1;guard();kill();' +
+  'var mo=new MutationObserver(function(ms){for(var j=0;j<ms.length;j++)for(var k=0;k<ms[j].addedNodes.length;k++)if(K(ms[j].addedNodes[k]))kill()});' +
+  'mo.observe(document.documentElement,{childList:true,subtree:true});window.addEventListener("load",kill)};' +
+  'start();document.addEventListener("DOMContentLoaded",start);})();</script>';
 
 // 剥离源页面/模板里已内联存在的水印脚本与节点
 function stripWatermark(text) {
